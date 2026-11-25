@@ -1,5 +1,4 @@
 import abc
-import ctypes
 import functools
 import math
 from typing import Optional
@@ -7,15 +6,7 @@ from typing import Optional
 import metatensor as mts
 import numpy as np
 import torch
-from ctypes_dlpack import (
-    DLDevice,
-    DLManagedTensorVersioned,
-    DLPackArray,
-    DLPackVersion,
-)
 from metatensor import Labels, TensorBlock, TensorMap
-from metatensor._c_api import mts_array_t
-from metatensor._status import check_status
 
 from .._capabilities import ModelCapabilities
 from .._quantity import Quantity
@@ -492,9 +483,9 @@ def _torch_system(
     )
 
     for options in system.known_pairs():
-        pairs = system.pairs(options)
+        pairs = system.pairs(options).to(array_backend="torch")
         samples = pairs.samples
-        vectors = _mts_array_to_torch(pairs._raw_values, positions)
+        vectors = pairs.values
         # register the pair vectors given by the engine with autograd, to make sure
         # gradients can flow from them to the positions and cell
         vectors = _PairsAutograd.apply(positions, cell, vectors, samples)
@@ -509,32 +500,9 @@ def _torch_system(
 
     for name in system.known_custom_data():
         data = system.custom_data(name)
-        new_system.add_custom_data(name, data.to(arrays="torch"))
+        new_system.add_custom_data(name, data.to(array_backend="torch"))
 
     return new_system, inputs
-
-
-def _mts_array_to_torch(array: mts_array_t, like: torch.Tensor) -> torch.Tensor:
-    """
-    Get the data in ``array`` as a :py:class:`torch.Tensor` on the same device as
-    ``like``, without copying it. This goes through DLPack, and thus works for arrays
-    created by any language, not only Python.
-
-    This is a temporary workaround until the :py:class:`metatensor.TensorMap` and
-    :py:class:`metatensor.TensorBlock` classes can return :py:class:`torch.Tensor`
-    directly even when the data origin is not ``python.torch``.
-    """
-    device_type, device_id = like.__dlpack_device__()
-    tensor = ctypes.POINTER(DLManagedTensorVersioned)()
-    status = array.as_dlpack(
-        array.ptr,
-        ctypes.byref(tensor),
-        DLDevice(device_type=device_type, device_id=device_id),
-        None,
-        DLPackVersion(major=1, minor=0),
-    )
-    check_status(status)
-    return torch.from_dlpack(DLPackArray(tensor))
 
 
 class _PairsAutograd(torch.autograd.Function):
@@ -557,12 +525,6 @@ class _PairsAutograd(torch.autograd.Function):
     def backward(ctx, vectors_grad):
         vectors_grad = vectors_grad.reshape(-1, 3)
 
-        def column(name: str) -> torch.Tensor:
-            # Once metatensor can return the samples as a torch.Tensor, we can use that
-            # directly instead of going through numpy here.
-            values = np.array(ctx.samples.column(name), dtype=np.int64)
-            return torch.from_numpy(values).to(vectors_grad.device)
-
         positions_grad = None
         if ctx.needs_input_grad[0]:
             positions_grad = torch.zeros(
@@ -570,16 +532,20 @@ class _PairsAutograd(torch.autograd.Function):
                 dtype=vectors_grad.dtype,
                 device=vectors_grad.device,
             )
-            positions_grad.index_add_(0, column("second_atom"), vectors_grad)
-            positions_grad.index_add_(0, column("first_atom"), vectors_grad, alpha=-1)
+            positions_grad.index_add_(
+                0, ctx.samples.column("second_atom"), vectors_grad
+            )
+            positions_grad.index_add_(
+                0, ctx.samples.column("first_atom"), vectors_grad, alpha=-1
+            )
 
         cell_grad = None
         if ctx.needs_input_grad[1]:
             cell_shifts = torch.stack(
                 [
-                    column("cell_shift_a"),
-                    column("cell_shift_b"),
-                    column("cell_shift_c"),
+                    ctx.samples.column("cell_shift_a"),
+                    ctx.samples.column("cell_shift_b"),
+                    ctx.samples.column("cell_shift_c"),
                 ],
                 dim=1,
             ).to(vectors_grad.dtype)
@@ -753,8 +719,9 @@ def _autograd_gradients(
                         ["sample", "system", "atom"],
                         grad_samples,
                         assume_unique=True,
-                    ),
-                    components=[Labels.range("xyz", 3)] + block.components,
+                    ).to(array_backend="torch"),
+                    components=[Labels.range("xyz", 3).to(array_backend="torch")]
+                    + block.components,
                     properties=block.properties,
                 ),
             )
@@ -774,8 +741,11 @@ def _autograd_gradients(
                 "strain",
                 TensorBlock(
                     values=grad_values,
-                    samples=Labels.range("sample", n_samples),
-                    components=[Labels.range("xyz_1", 3), Labels.range("xyz_2", 3)]
+                    samples=Labels.range("sample", n_samples, array_backend="torch"),
+                    components=[
+                        Labels.range("xyz_1", 3, array_backend="torch"),
+                        Labels.range("xyz_2", 3, array_backend="torch"),
+                    ]
                     + block.components,
                     properties=block.properties,
                 ),
